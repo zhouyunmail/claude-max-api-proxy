@@ -10,6 +10,7 @@
 
 import { startServer, stopServer } from "./index.js";
 import { verifyClaude, verifyAuth } from "../subprocess/manager.js";
+import { processPool } from "../subprocess/pool.js";
 
 const DEFAULT_PORT = 3456;
 
@@ -51,6 +52,10 @@ async function main(): Promise<void> {
     console.log(`    -H "Content-Type: application/json" \\`);
     console.log(`    -d '{"model": "claude-sonnet-4", "messages": [{"role": "user", "content": "Hello!"}]}'`);
     console.log("\nPress Ctrl+C to stop.\n");
+
+    // Pre-warm the process pool (non-blocking, logs internally)
+    console.log("Pre-warming process pool...");
+    await processPool.warmUp("opus");
   } catch (err) {
     console.error("Failed to start server:", err);
     process.exit(1);
@@ -59,6 +64,7 @@ async function main(): Promise<void> {
   // Handle graceful shutdown
   const shutdown = async () => {
     console.log("\nShutting down...");
+    processPool.shutdown();
     await stopServer();
     process.exit(0);
   };

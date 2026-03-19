@@ -14,6 +14,7 @@ import type {
   ClaudeCliAssistant,
   ClaudeCliResult,
   ClaudeCliStreamEvent,
+  ClaudeCliSystemMessage,
 } from "../types/claude-cli.js";
 import {
   isAssistantMessage,
@@ -95,11 +96,12 @@ export class ClaudeSubprocess extends EventEmitter {
   private isKilled: boolean = false;
 
   /**
-   * Start the Claude CLI subprocess with the given prompt
+   * Spawn the Claude CLI subprocess without sending a prompt.
+   * The process starts, initializes, and blocks waiting for stdin.
+   * Call sendPrompt() later to actually begin processing.
    */
-  async start(prompt: string, options: SubprocessOptions): Promise<void> {
+  async spawn(options: SubprocessOptions): Promise<void> {
     const args = this.buildArgs(options);
-    const timeout = options.timeout || DEFAULT_TIMEOUT;
 
     return new Promise((resolve, reject) => {
       try {
@@ -111,15 +113,6 @@ export class ClaudeSubprocess extends EventEmitter {
           ),
           stdio: ["pipe", "pipe", "pipe"],
         });
-
-        // Set timeout
-        this.timeoutId = setTimeout(() => {
-          if (!this.isKilled) {
-            this.isKilled = true;
-            this.process?.kill("SIGTERM");
-            this.emit("error", new Error(`Request timed out after ${timeout}ms`));
-          }
-        }, timeout);
 
         // Handle spawn errors (e.g., claude not found)
         this.process.on("error", (err) => {
@@ -134,10 +127,6 @@ export class ClaudeSubprocess extends EventEmitter {
             reject(err);
           }
         });
-
-        // Pass prompt via stdin to avoid E2BIG on large inputs
-        this.process.stdin?.write(prompt);
-        this.process.stdin?.end();
 
         if (process.env.DEBUG_SUBPROCESS) {
           console.error(`[Subprocess] Process spawned with PID: ${this.process.pid}`);
@@ -157,8 +146,6 @@ export class ClaudeSubprocess extends EventEmitter {
         this.process.stderr?.on("data", (chunk: Buffer) => {
           const errorText = chunk.toString().trim();
           if (errorText) {
-            // Don't emit as error unless it's actually an error
-            // Claude CLI may write debug info to stderr
             if (process.env.DEBUG_SUBPROCESS) {
               console.error("[Subprocess stderr]:", errorText.slice(0, 200));
             }
@@ -171,20 +158,50 @@ export class ClaudeSubprocess extends EventEmitter {
             console.error(`[Subprocess] Process closed with code: ${code}`);
           }
           this.clearTimeout();
-          // Process any remaining buffer
           if (this.buffer.trim()) {
             this.processBuffer();
           }
           this.emit("close", code);
         });
 
-        // Resolve immediately since we're streaming
+        // Resolve immediately - process is alive and waiting for stdin
         resolve();
       } catch (err) {
         this.clearTimeout();
         reject(err);
       }
     });
+  }
+
+  /**
+   * Send the prompt to an already-spawned subprocess and start the timeout.
+   * Must be called after spawn().
+   */
+  sendPrompt(prompt: string, timeout?: number): void {
+    if (!this.process || this.isKilled) {
+      throw new Error("Cannot send prompt: process not running");
+    }
+    const t = timeout || DEFAULT_TIMEOUT;
+    this.timeoutId = setTimeout(() => {
+      if (!this.isKilled) {
+        this.isKilled = true;
+        this.process?.kill("SIGTERM");
+        this.emit("error", new Error(`Request timed out after ${t}ms`));
+      }
+    }, t);
+
+    // Pass prompt via stdin to avoid E2BIG on large inputs
+    this.process.stdin?.write(prompt);
+    this.process.stdin?.end();
+  }
+
+  /**
+   * Start the Claude CLI subprocess with the given prompt (convenience method).
+   * Equivalent to spawn() + sendPrompt().
+   */
+  async start(prompt: string, options: SubprocessOptions): Promise<void> {
+    await this.spawn(options);
+    this.sendPrompt(prompt, options.timeout);
   }
 
   /**
@@ -282,10 +299,65 @@ export class ClaudeSubprocess extends EventEmitter {
   }
 
   /**
+   * Wait for the CLI to emit its init message, indicating it's fully
+   * initialized and ready to accept a prompt via stdin.
+   * Used by the process pool to ensure pre-warmed processes are truly ready.
+   */
+  waitForInit(timeout = 30_000): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      if (!this.process || this.isKilled) {
+        reject(new Error("Process not running"));
+        return;
+      }
+
+      const timer = setTimeout(() => {
+        this.removeListener("message", handler);
+        reject(new Error(`Timed out waiting for CLI init after ${timeout}ms`));
+      }, timeout);
+
+      const cleanup = () => {
+        clearTimeout(timer);
+        this.removeListener("message", handler);
+        this.removeListener("close", closeHandler);
+      };
+
+      const handler = (msg: ClaudeCliMessage) => {
+        if (msg.type === "system" && (msg as ClaudeCliSystemMessage).subtype === "init") {
+          cleanup();
+          resolve();
+        }
+      };
+
+      // Also reject if process exits (avoid dangling promise)
+      const closeHandler = () => {
+        cleanup();
+        reject(new Error("Process exited before init"));
+      };
+
+      this.on("message", handler);
+      this.once("close", closeHandler);
+    });
+  }
+
+  /**
    * Check if the process is still running
    */
   isRunning(): boolean {
     return this.process !== null && !this.isKilled && this.process.exitCode === null;
+  }
+
+  /**
+   * Check if the process is running AND stdin is still writable.
+   * A process can be "running" but have a broken/closed stdin pipe,
+   * which would cause sendPrompt to fail.
+   */
+  isReady(): boolean {
+    return (
+      this.isRunning() &&
+      this.process?.stdin !== null &&
+      this.process?.stdin !== undefined &&
+      this.process.stdin.writable === true
+    );
   }
 }
 

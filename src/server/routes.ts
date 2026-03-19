@@ -6,7 +6,9 @@
 
 import type { Request, Response } from "express";
 import { v4 as uuidv4 } from "uuid";
-import { ClaudeSubprocess } from "../subprocess/manager.js";
+import type { ClaudeSubprocess } from "../subprocess/manager.js";
+import { processPool } from "../subprocess/pool.js";
+import type { AcquireResult } from "../subprocess/pool.js";
 import { openaiToCli } from "../adapter/openai-to-cli.js";
 import {
   cliResultToOpenai,
@@ -28,6 +30,8 @@ export async function handleChatCompletions(
   const body = req.body as OpenAIChatRequest;
   const stream = body.stream === true;
 
+  const t0 = Date.now();
+
   try {
     // Validate request
     if (!body.messages || !Array.isArray(body.messages) || body.messages.length === 0) {
@@ -41,14 +45,22 @@ export async function handleChatCompletions(
       return;
     }
 
-    // Convert to CLI input format
+    // Convert to CLI input format and acquire a (possibly pre-warmed) subprocess
     const cliInput = openaiToCli(body);
-    const subprocess = new ClaudeSubprocess();
+    const acquired = await processPool.acquire({
+      model: cliInput.model,
+      sessionId: cliInput.sessionId,
+    });
+
+    const mode = stream ? "stream" : "non-stream";
+    console.log(
+      `[Req ${requestId.slice(0, 8)}] ${mode} model=${cliInput.model} pool=${acquired.source} acquire=${acquired.acquireMs}ms`
+    );
 
     if (stream) {
-      await handleStreamingResponse(req, res, subprocess, cliInput, requestId);
+      await handleStreamingResponse(req, res, acquired.subprocess, cliInput, requestId, t0, acquired);
     } else {
-      await handleNonStreamingResponse(res, subprocess, cliInput, requestId);
+      await handleNonStreamingResponse(res, acquired.subprocess, cliInput, requestId, t0, acquired);
     }
   } catch (error) {
     const message = error instanceof Error ? error.message : "Unknown error";
@@ -86,7 +98,9 @@ async function handleStreamingResponse(
   res: Response,
   subprocess: ClaudeSubprocess,
   cliInput: ReturnType<typeof openaiToCli>,
-  requestId: string
+  requestId: string,
+  t0: number,
+  acquired: AcquireResult,
 ): Promise<void> {
   // Set SSE headers
   res.setHeader("Content-Type", "text/event-stream");
@@ -108,6 +122,8 @@ async function handleStreamingResponse(
     let hasEmittedText = false;
     let toolCallIndex = 0;
     let inToolBlock = false;
+    let ttfbLogged = false;
+    const rid = requestId.slice(0, 8);
 
     // Handle actual client disconnect (response stream closed)
     res.on("close", () => {
@@ -144,6 +160,13 @@ async function handleStreamingResponse(
       const delta = event.event.delta;
       const text = (delta?.type === "text_delta" && delta.text) || "";
       if (text && !res.writableEnded) {
+        if (!ttfbLogged) {
+          ttfbLogged = true;
+          const ttfb = Date.now() - t0;
+          console.log(
+            `[Req ${rid}] TTFB=${ttfb}ms (pool=${acquired.source} acquire=${acquired.acquireMs}ms promptToToken=${ttfb - acquired.acquireMs}ms)`
+          );
+        }
         const chunk = {
           id: `chatcmpl-${requestId}`,
           object: "chat.completion.chunk",
@@ -242,15 +265,20 @@ async function handleStreamingResponse(
 
     subprocess.on("result", (result: ClaudeCliResult) => {
       isComplete = true;
+      const totalMs = Date.now() - t0;
+      const inputTokens = result.usage?.input_tokens || 0;
+      const outputTokens = result.usage?.output_tokens || 0;
+      console.log(
+        `[Req ${rid}] DONE stream total=${totalMs}ms tokens=${inputTokens}+${outputTokens} pool=${acquired.source}`
+      );
       if (!res.writableEnded) {
         // Send final done chunk with finish_reason and usage data
         const doneChunk = createDoneChunk(requestId, lastModel);
         if (result.usage) {
           doneChunk.usage = {
-            prompt_tokens: result.usage.input_tokens || 0,
-            completion_tokens: result.usage.output_tokens || 0,
-            total_tokens:
-              (result.usage.input_tokens || 0) + (result.usage.output_tokens || 0),
+            prompt_tokens: inputTokens,
+            completion_tokens: outputTokens,
+            total_tokens: inputTokens + outputTokens,
           };
         }
         res.write(`data: ${JSON.stringify(doneChunk)}\n\n`);
@@ -288,14 +316,13 @@ async function handleStreamingResponse(
       resolve();
     });
 
-    // Start the subprocess
-    subprocess.start(cliInput.prompt, {
-      model: cliInput.model,
-      sessionId: cliInput.sessionId,
-    }).catch((err) => {
-      console.error("[Streaming] Subprocess start error:", err);
+    // Send prompt to the (already spawned) subprocess
+    try {
+      subprocess.sendPrompt(cliInput.prompt);
+    } catch (err) {
+      console.error("[Streaming] sendPrompt error:", err);
       reject(err);
-    });
+    }
   });
 }
 
@@ -306,8 +333,11 @@ async function handleNonStreamingResponse(
   res: Response,
   subprocess: ClaudeSubprocess,
   cliInput: ReturnType<typeof openaiToCli>,
-  requestId: string
+  requestId: string,
+  t0: number,
+  acquired: AcquireResult,
 ): Promise<void> {
+  const rid = requestId.slice(0, 8);
   return new Promise((resolve) => {
     let finalResult: ClaudeCliResult | null = null;
     // DISABLED: see tool call forwarding comment in handleStreamingResponse
@@ -345,9 +375,16 @@ async function handleNonStreamingResponse(
     });
 
     subprocess.on("close", (code: number | null) => {
+      const totalMs = Date.now() - t0;
       if (finalResult) {
+        const inputTokens = finalResult.usage?.input_tokens || 0;
+        const outputTokens = finalResult.usage?.output_tokens || 0;
+        console.log(
+          `[Req ${rid}] DONE non-stream total=${totalMs}ms tokens=${inputTokens}+${outputTokens} pool=${acquired.source}`
+        );
         res.json(cliResultToOpenai(finalResult, requestId));
       } else if (!res.headersSent) {
+        console.log(`[Req ${rid}] FAIL non-stream total=${totalMs}ms exit=${code} pool=${acquired.source}`);
         res.status(500).json({
           error: {
             message: `Claude CLI exited with code ${code} without response`,
@@ -359,22 +396,21 @@ async function handleNonStreamingResponse(
       resolve();
     });
 
-    // Start the subprocess
-    subprocess
-      .start(cliInput.prompt, {
-        model: cliInput.model,
-        sessionId: cliInput.sessionId,
-      })
-      .catch((error) => {
-        res.status(500).json({
-          error: {
-            message: error.message,
-            type: "server_error",
-            code: null,
-          },
-        });
-        resolve();
+    // Send prompt to the (already spawned) subprocess
+    try {
+      subprocess.sendPrompt(cliInput.prompt);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.log(`[Req ${rid}] FAIL sendPrompt: ${message} pool=${acquired.source}`);
+      res.status(500).json({
+        error: {
+          message,
+          type: "server_error",
+          code: null,
+        },
       });
+      resolve();
+    }
   });
 }
 
@@ -415,5 +451,6 @@ export function handleHealth(_req: Request, res: Response): void {
     status: "ok",
     provider: "claude-code-cli",
     timestamp: new Date().toISOString(),
+    pool: processPool.stats(),
   });
 }
