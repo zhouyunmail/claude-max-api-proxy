@@ -50,11 +50,18 @@ export async function handleChatCompletions(
     const acquired = await processPool.acquire({
       model: cliInput.model,
       sessionId: cliInput.sessionId,
+      effort: cliInput.effort,
+      tools: cliInput.tools,
     });
 
     const mode = stream ? "stream" : "non-stream";
+    const promptKB = (Buffer.byteLength(cliInput.prompt, "utf8") / 1024).toFixed(1);
+    const extras = [
+      cliInput.effort && `effort=${cliInput.effort}`,
+      cliInput.tools !== undefined && `tools=${cliInput.tools || "none"}`,
+    ].filter(Boolean).join(" ");
     console.log(
-      `[Req ${requestId.slice(0, 8)}] ${mode} model=${cliInput.model} pool=${acquired.source} acquire=${acquired.acquireMs}ms`
+      `[Req ${requestId.slice(0, 8)}] ${mode} model=${cliInput.model} prompt=${promptKB}KB pool=${acquired.source} acquire=${acquired.acquireMs}ms${extras ? " " + extras : ""}`
     );
 
     if (stream) {

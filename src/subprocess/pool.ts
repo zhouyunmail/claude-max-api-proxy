@@ -7,6 +7,7 @@
  */
 
 import { ClaudeSubprocess } from "./manager.js";
+import type { EffortLevel } from "./manager.js";
 import type { ClaudeModel } from "../adapter/openai-to-cli.js";
 
 interface PoolEntry {
@@ -76,12 +77,20 @@ export class ProcessPool {
     model: ClaudeModel;
     sessionId?: string;
     cwd?: string;
+    effort?: EffortLevel;
+    tools?: string;
   }): Promise<AcquireResult> {
     const t0 = Date.now();
 
-    // sessionId requires specific args at spawn time — must cold-start
-    if (options.sessionId) {
-      console.log(`[Pool] Cold start (sessionId: ${options.sessionId.slice(0, 8)}…)`);
+    // sessionId / effort / tools require specific args at spawn time — must cold-start
+    const needsColdStart = options.sessionId || options.effort || options.tools !== undefined;
+    if (needsColdStart) {
+      const reason = options.sessionId
+        ? `sessionId: ${options.sessionId.slice(0, 8)}…`
+        : options.effort
+          ? `effort: ${options.effort}`
+          : `tools: ${options.tools || "none"}`;
+      console.log(`[Pool] Cold start (${reason})`);
       const sub = new ClaudeSubprocess();
       await sub.spawn(options);
       return { subprocess: sub, source: "cold-session", acquireMs: Date.now() - t0 };

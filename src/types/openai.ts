@@ -23,6 +23,9 @@ export interface OpenAIChatRequest {
   frequency_penalty?: number;
   presence_penalty?: number;
   user?: string; // Used for session mapping
+  // Claude Code extensions (passed via extra_body or top-level)
+  effort?: "low" | "medium" | "high" | "max";
+  tools_allowed?: string; // e.g. "Bash,Read,Write" or "" to disable
 }
 
 export interface OpenAIToolCall {

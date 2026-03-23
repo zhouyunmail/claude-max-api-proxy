@@ -10,6 +10,8 @@ export interface CliInput {
   prompt: string;
   model: ClaudeModel;
   sessionId?: string;
+  effort?: "low" | "medium" | "high" | "max";
+  tools?: string;
 }
 
 const MODEL_MAP: Record<string, ClaudeModel> = {
@@ -140,5 +142,7 @@ export function openaiToCli(request: OpenAIChatRequest): CliInput {
     prompt: messagesToPrompt(request.messages),
     model: extractModel(request.model),
     sessionId: request.user, // Use OpenAI's user field for session mapping
+    effort: request.effort,
+    tools: request.tools_allowed,
   };
 }

@@ -70,6 +70,25 @@ function createApp(): Express {
     res.sendStatus(200);
   });
 
+  // API key authentication (if PROXY_API_KEY is set)
+  const apiKey = process.env.PROXY_API_KEY;
+  if (apiKey) {
+    app.use("/v1", (req: Request, res: Response, next: NextFunction) => {
+      const auth = req.headers.authorization;
+      if (!auth || auth !== `Bearer ${apiKey}`) {
+        res.status(401).json({
+          error: {
+            message: "Invalid API key",
+            type: "authentication_error",
+            code: "invalid_api_key",
+          },
+        });
+        return;
+      }
+      next();
+    });
+  }
+
   // Routes
   app.get("/health", handleHealth);
   app.get("/v1/models", handleModels);
@@ -105,7 +124,7 @@ function createApp(): Express {
  * Start the HTTP server
  */
 export async function startServer(config: ServerConfig): Promise<Server> {
-  const { port, host = "127.0.0.1" } = config;
+  const { port, host = process.env.PROXY_HOST || "127.0.0.1" } = config;
 
   if (serverInstance) {
     console.log("[Server] Already running, returning existing instance");

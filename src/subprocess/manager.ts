@@ -27,11 +27,15 @@ import {
 } from "../types/claude-cli.js";
 import type { ClaudeModel } from "../adapter/openai-to-cli.js";
 
+export type EffortLevel = "low" | "medium" | "high" | "max";
+
 export interface SubprocessOptions {
   model: ClaudeModel;
   sessionId?: string;
   cwd?: string;
   timeout?: number;
+  effort?: EffortLevel;
+  tools?: string;   // e.g. "Bash,Read,Write" or "" to disable all
 }
 
 export interface SubprocessEvents {
@@ -46,9 +50,8 @@ export interface SubprocessEvents {
 const DEFAULT_TIMEOUT = 900000; // 15 minutes
 
 /**
- * System prompt appended to Claude CLI to map OpenClaw tool names to Claude Code equivalents.
- * OpenClaw's system prompt references tools like `exec`, `read`, `web_search` etc. that
- * don't exist in Claude Code. This mapping tells the model what to use instead.
+ * Compressed system prompt mapping OpenClaw tool names to Claude Code equivalents.
+ * Kept minimal to reduce input token overhead on every request.
  */
 const OPENCLAW_TOOL_MAPPING_PROMPT = [
   "## Tool Name Mapping",
@@ -77,10 +80,6 @@ const OPENCLAW_TOOL_MAPPING_PROMPT = [
   '- `sessions_history` → `Bash(openclaw agent --local --message "show history for session <key>")` or check session files',
   "- `nodes` → `Bash(openclaw nodes status)`, `Bash(openclaw nodes describe <node>)`, `Bash(openclaw nodes invoke --node <id> --command <cmd>)`",
   '  - Also: `openclaw nodes run --node <id> "<shell command>"` for running commands on paired nodes',
-  "",
-  "### Not available via CLI",
-  "- `browser` — requires OpenClaw's dedicated browser server (no CLI equivalent)",
-  "- `canvas` — requires paired node with canvas capability; use `openclaw nodes invoke` if a node is available",
   "",
   "### Skills",
   "When a skill says to run a bash/python command, use the `Bash` tool directly.",
@@ -142,19 +141,17 @@ export class ClaudeSubprocess extends EventEmitter {
           this.processBuffer();
         });
 
-        // Capture stderr for debugging
+        // Capture stderr — always log so errors aren't silently swallowed
         this.process.stderr?.on("data", (chunk: Buffer) => {
           const errorText = chunk.toString().trim();
           if (errorText) {
-            if (process.env.DEBUG_SUBPROCESS) {
-              console.error("[Subprocess stderr]:", errorText.slice(0, 200));
-            }
+            console.error("[Subprocess stderr]:", errorText.slice(0, 500));
           }
         });
 
         // Handle process close
         this.process.on("close", (code) => {
-          if (process.env.DEBUG_SUBPROCESS) {
+          if (code !== 0) {
             console.error(`[Subprocess] Process closed with code: ${code}`);
           }
           this.clearTimeout();
@@ -225,6 +222,14 @@ export class ClaudeSubprocess extends EventEmitter {
 
     if (options.sessionId) {
       args.push("--session-id", options.sessionId);
+    }
+
+    if (options.effort) {
+      args.push("--effort", options.effort);
+    }
+
+    if (options.tools !== undefined) {
+      args.push("--tools", options.tools);
     }
 
     return args;

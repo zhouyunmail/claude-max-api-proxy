@@ -1,10 +1,10 @@
 # Claude Max API Proxy
 
-> Actively maintained fork of [atalovesyou/claude-max-api-proxy](https://github.com/atalovesyou/claude-max-api-proxy) with OpenClaw integration, improved streaming, and expanded model support.
-
 **Use your Claude Max subscription ($200/month) with any OpenAI-compatible client — no separate API costs!**
 
-This proxy wraps the Claude Code CLI as a subprocess and exposes an OpenAI-compatible HTTP API, allowing tools like OpenClaw, Continue.dev, or any OpenAI-compatible client to use your Claude Max subscription instead of paying per-API-call.
+This proxy wraps the Claude Code CLI as a subprocess and exposes an OpenAI-compatible HTTP API, allowing tools like [OpenClaw](https://github.com/openclaw/openclaw), [Continue.dev](https://continue.dev/), or any OpenAI-compatible client to use your Claude Max subscription instead of paying per-API-call.
+
+> Fork of [atalovesyou/claude-max-api-proxy](https://github.com/atalovesyou/claude-max-api-proxy) with subprocess pool prewarming, API key auth, effort control, and enhanced logging.
 
 ## Why This Exists
 
@@ -14,7 +14,7 @@ This proxy wraps the Claude Code CLI as a subprocess and exposes an OpenAI-compa
 | Claude Max | $200/month flat | OAuth blocked for third-party API use |
 | **This Proxy** | $0 extra (uses Max subscription) | Routes through CLI |
 
-Anthropic blocks OAuth tokens from being used directly with third-party API clients. However, the Claude Code CLI *can* use OAuth tokens. This proxy bridges that gap by wrapping the CLI and exposing a standard API.
+Anthropic blocks OAuth tokens from being used directly with third-party API clients. The Claude Code CLI *can* use OAuth tokens. This proxy bridges the gap.
 
 ## How It Works
 
@@ -23,36 +23,29 @@ Your App (OpenClaw, Continue.dev, etc.)
          ↓
     HTTP Request (OpenAI format)
          ↓
-   Claude Max API Proxy (this project)
+   Claude Max API Proxy
          ↓
-   Claude Code CLI (subprocess)
+   Subprocess Pool (prewarmed)
          ↓
-   OAuth Token (from Max subscription)
+   Claude Code CLI (spawn)
          ↓
-   Anthropic API
+   Anthropic API (via OAuth)
          ↓
    Response → OpenAI format → Your App
 ```
 
 ## Features
 
-- **OpenAI-compatible API** — Works with any client that supports OpenAI's API format
-- **Streaming support** — Real-time token streaming via Server-Sent Events
-- **Multiple models** — Claude Opus, Sonnet, and Haiku with flexible model aliases
-- **OpenClaw integration** — Automatic tool name mapping and system prompt adaptation
-- **Content block handling** — Proper text block separators for multi-block responses
-- **Session management** — Maintains conversation context via session IDs
-- **Auto-start service** — Optional LaunchAgent for macOS
+- **OpenAI-compatible API** — Drop-in replacement for OpenAI endpoints
+- **Subprocess pool with prewarming** — Pre-spawns CLI processes to eliminate cold-start latency
+- **Streaming support** — Real-time SSE with TTFB tracking and client disconnect detection
+- **Multiple models** — Opus, Sonnet, Haiku with flexible aliases
+- **API key authentication** — Optional Bearer token auth via `PROXY_API_KEY`
+- **Effort control** — Pass `effort` parameter (low/medium/high) to control reasoning depth
+- **Tool restrictions** — Pass `tools_allowed` to limit available CLI tools
+- **Session management** — Map `user` field to persistent CLI sessions
 - **Zero configuration** — Uses existing Claude CLI authentication
-- **Secure by design** — Uses `spawn()` to prevent shell injection
-
-## What's Different from the Original
-
-- **OpenClaw tool mapping** — Maps OpenClaw tool names (`exec`, `read`, `web_search`, etc.) to Claude Code equivalents (`Bash`, `Read`, `WebSearch`)
-- **System prompt stripping** — Removes OpenClaw-specific tooling sections that confuse the CLI
-- **Content block support** — Handles `input_text` content blocks and multi-block text separators
-- **Tool call types** — Full OpenAI tool call type definitions for streaming and non-streaming
-- **Improved streaming** — Better SSE handling with connection confirmation and client disconnect detection
+- **Secure by design** — `spawn()` (not shell) prevents injection attacks
 
 ## Prerequisites
 
@@ -66,45 +59,35 @@ Your App (OpenClaw, Continue.dev, etc.)
 ## Installation
 
 ```bash
-# Clone the repository
-git clone https://github.com/wende/claude-max-api-proxy.git
+git clone https://github.com/zhouyunmail/claude-max-api-proxy.git
 cd claude-max-api-proxy
-
-# Install dependencies
 npm install
-
-# Build
 npm run build
 ```
 
-## Usage
-
-### Start the server
+## Quick Start
 
 ```bash
+# Start the server (default: 127.0.0.1:3456)
 npm start
-# or
-node dist/server/standalone.js
+
+# Or with custom config
+PROXY_HOST=0.0.0.0 POOL_SIZE=5 PROXY_API_KEY=my-secret npm start
 ```
 
-The server runs at `http://localhost:3456` by default. Pass a custom port as an argument:
+## Usage Examples
 
 ```bash
-node dist/server/standalone.js 8080
-```
-
-### Test it
-
-```bash
-# Health check
+# Health check (includes pool stats)
 curl http://localhost:3456/health
 
-# List models
+# List available models
 curl http://localhost:3456/v1/models
 
 # Chat completion (non-streaming)
 curl -X POST http://localhost:3456/v1/chat/completions \
   -H "Content-Type: application/json" \
+  -H "Authorization: Bearer my-secret" \
   -d '{
     "model": "claude-sonnet-4",
     "messages": [{"role": "user", "content": "Hello!"}]
@@ -114,39 +97,39 @@ curl -X POST http://localhost:3456/v1/chat/completions \
 curl -N -X POST http://localhost:3456/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "claude-sonnet-4",
-    "messages": [{"role": "user", "content": "Hello!"}],
+    "model": "claude-opus-4",
+    "messages": [{"role": "user", "content": "Explain quicksort"}],
     "stream": true
+  }'
+
+# With effort control
+curl -X POST http://localhost:3456/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "claude-opus-4",
+    "messages": [{"role": "user", "content": "Solve this math problem..."}],
+    "effort": "high"
   }'
 ```
 
-## API Endpoints
+### Python (OpenAI SDK)
 
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/health` | GET | Health check |
-| `/v1/models` | GET | List available models |
-| `/v1/chat/completions` | POST | Chat completions (streaming & non-streaming) |
+```python
+from openai import OpenAI
 
-## Available Models
+client = OpenAI(
+    base_url="http://localhost:3456/v1",
+    api_key="my-secret"  # or "not-needed" if PROXY_API_KEY is not set
+)
 
-| Model ID | Alias | CLI Model |
-|----------|-------|-----------|
-| `claude-opus-4` | `opus` | Claude Opus |
-| `claude-sonnet-4` | `sonnet` | Claude Sonnet |
-| `claude-haiku-4` | `haiku` | Claude Haiku |
-
-All model IDs also accept a `claude-code-cli/` prefix (e.g., `claude-code-cli/claude-opus-4`). Unknown models default to Opus.
-
-## Configuration with Popular Tools
-
-### OpenClaw
-
-OpenClaw works with this proxy out of the box. The proxy automatically maps OpenClaw tool names to Claude Code equivalents and strips conflicting tooling sections from system prompts.
+response = client.chat.completions.create(
+    model="claude-sonnet-4",
+    messages=[{"role": "user", "content": "Hello!"}]
+)
+print(response.choices[0].message.content)
+```
 
 ### Continue.dev
-
-Add to your Continue config:
 
 ```json
 {
@@ -160,30 +143,62 @@ Add to your Continue config:
 }
 ```
 
-### Generic OpenAI Client (Python)
+## API Endpoints
 
-```python
-from openai import OpenAI
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/health` | GET | Health check with pool stats (size, ready, hit rate) |
+| `/v1/models` | GET | List available models |
+| `/v1/chat/completions` | POST | Chat completions (streaming & non-streaming) |
 
-client = OpenAI(
-    base_url="http://localhost:3456/v1",
-    api_key="not-needed"  # Any value works
-)
+## Available Models
 
-response = client.chat.completions.create(
-    model="claude-sonnet-4",
-    messages=[{"role": "user", "content": "Hello!"}]
-)
-```
+| Model ID | Aliases | Description |
+|----------|---------|-------------|
+| `claude-opus-4` | `opus`, `claude-opus-4-6` | Most capable, best for complex tasks |
+| `claude-sonnet-4` | `sonnet`, `claude-sonnet-4-5`, `claude-sonnet-4-6` | Balanced performance and speed |
+| `claude-haiku-4` | `haiku`, `claude-haiku-4-5` | Fastest, best for simple tasks |
 
-## Auto-Start on macOS
+Unknown model names default to Opus.
 
-The proxy can run as a macOS LaunchAgent on port 3456.
+## Environment Variables
 
-**Plist location:** `~/Library/LaunchAgents/com.openclaw.claude-max-proxy.plist`
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PROXY_HOST` | `127.0.0.1` | Bind address (use `0.0.0.0` for network access) |
+| `PROXY_API_KEY` | _(none)_ | Bearer token for `/v1/*` routes (optional) |
+| `CLAUDE_BIN` | `claude` | Path to Claude Code CLI binary |
+| `POOL_SIZE` | `3` | Number of pre-warmed processes per model |
+| `DEBUG` | _(none)_ | Set `1` to log request paths and body samples |
+| `DEBUG_SUBPROCESS` | _(none)_ | Set `1` to log subprocess I/O |
+
+## Subprocess Pool
+
+The proxy maintains a pool of pre-spawned Claude CLI processes to minimize response latency:
+
+- **Prewarming** — `POOL_SIZE` processes per model are spawned at startup
+- **Hit/Miss tracking** — Pool stats available via `/health` endpoint
+- **Auto-cleanup** — Idle processes (>5 min) are killed and replaced
+- **Cold-start fallback** — If pool is empty or request needs special args (session/effort/tools), a new process is spawned on demand
+
+## Running as a Service
+
+### systemd (Linux)
 
 ```bash
-# Start the service
+# Enable and start
+systemctl --user enable claude-max-api-proxy
+systemctl --user start claude-max-api-proxy
+
+# Check status / logs
+systemctl --user status claude-max-api-proxy
+journalctl --user -u claude-max-api-proxy -f
+```
+
+### launchctl (macOS)
+
+```bash
+# Start
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.openclaw.claude-max-proxy.plist
 
 # Restart
@@ -191,9 +206,6 @@ launchctl kickstart -k gui/$(id -u)/com.openclaw.claude-max-proxy
 
 # Stop
 launchctl bootout gui/$(id -u)/com.openclaw.claude-max-proxy
-
-# Check status
-launchctl list com.openclaw.claude-max-proxy
 ```
 
 ## Architecture
@@ -201,56 +213,32 @@ launchctl list com.openclaw.claude-max-proxy
 ```
 src/
 ├── types/
-│   ├── claude-cli.ts      # Claude CLI JSON streaming types + type guards
-│   └── openai.ts          # OpenAI API types (including tool calls)
+│   ├── claude-cli.ts      # Claude CLI JSON streaming types
+│   └── openai.ts          # OpenAI API types (request/response/tool calls)
 ├── adapter/
-│   ├── openai-to-cli.ts   # Convert OpenAI requests → CLI format
-│   └── cli-to-openai.ts   # Convert CLI responses → OpenAI format
+│   ├── openai-to-cli.ts   # OpenAI request → CLI format + model mapping
+│   └── cli-to-openai.ts   # CLI response → OpenAI format + token tracking
 ├── subprocess/
-│   └── manager.ts         # Claude CLI subprocess + OpenClaw tool mapping
-├── session/
-│   └── manager.ts         # Session ID mapping
+│   ├── manager.ts         # CLI process lifecycle + tool name mapping
+│   └── pool.ts            # Process pool with prewarming + hit/miss stats
 ├── server/
-│   ├── index.ts           # Express server setup
-│   ├── routes.ts          # API route handlers
+│   ├── index.ts           # Express server + auth middleware
+│   ├── routes.ts          # API route handlers (streaming + non-streaming)
 │   └── standalone.ts      # Entry point
 └── index.ts               # Package exports
 ```
 
-## Security
-
-- Uses Node.js `spawn()` instead of shell execution to prevent injection attacks
-- No API keys stored or transmitted by this proxy
-- All authentication handled by Claude CLI's secure keychain storage
-- Prompts passed as CLI arguments, not through shell interpretation
-
 ## Troubleshooting
 
-### "Claude CLI not found"
-
-Install and authenticate the CLI:
+**"Claude CLI not found"** — Install and authenticate:
 ```bash
 npm install -g @anthropic-ai/claude-code
 claude auth login
 ```
 
-### Streaming returns immediately with no content
+**Streaming returns empty** — Use `-N` flag with curl to disable buffering.
 
-Ensure you're using `-N` flag with curl (disables buffering):
-```bash
-curl -N -X POST http://localhost:3456/v1/chat/completions ...
-```
-
-### Server won't start
-
-Check that the Claude CLI is in your PATH:
-```bash
-which claude
-```
-
-## Contributing
-
-Contributions welcome! Please submit PRs with tests.
+**High latency on first request** — The pool may still be warming up. Check `/health` for pool readiness.
 
 ## License
 
@@ -259,5 +247,4 @@ MIT
 ## Acknowledgments
 
 - Originally created by [atalovesyou](https://github.com/atalovesyou/claude-max-api-proxy)
-- Built for use with [OpenClaw](https://openclaw.com)
 - Powered by [Claude Code CLI](https://github.com/anthropics/claude-code)
