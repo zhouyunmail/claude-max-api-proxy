@@ -72,7 +72,7 @@ npm run build
 npm start
 
 # Or with custom config
-PROXY_HOST=0.0.0.0 POOL_SIZE=5 PROXY_API_KEY=my-secret npm start
+PROXY_HOST=0.0.0.0 POOL_SIZE=2 PROXY_API_KEY=my-secret npm start
 ```
 
 ## Usage Examples
@@ -168,7 +168,7 @@ Unknown model names default to Opus.
 | `PROXY_HOST` | `127.0.0.1` | Bind address (use `0.0.0.0` for network access) |
 | `PROXY_API_KEY` | _(none)_ | Bearer token for `/v1/*` routes (optional) |
 | `CLAUDE_BIN` | `claude` | Path to Claude Code CLI binary |
-| `POOL_SIZE` | `3` | Number of pre-warmed processes per model |
+| `POOL_SIZE` | `2` | Number of pre-warmed processes per model |
 | `DEBUG` | _(none)_ | Set `1` to log request paths and body samples |
 | `DEBUG_SUBPROCESS` | _(none)_ | Set `1` to log subprocess I/O |
 

@@ -27,7 +27,7 @@ export interface AcquireResult {
 const MAX_IDLE_MS = 300_000; // 5 minutes
 
 /** Default number of warm processes per model (override with POOL_SIZE env var) */
-const DEFAULT_POOL_SIZE = parseInt(process.env.POOL_SIZE || "3", 10) || 3;
+const DEFAULT_POOL_SIZE = parseInt(process.env.POOL_SIZE || "2", 10) || 3;
 
 /** Only auto-refill the default model to avoid unbounded memory growth */
 const DEFAULT_WARM_MODEL: ClaudeModel = (process.env.WARM_MODEL as ClaudeModel) || "opus";
