@@ -47,27 +47,34 @@ export async function handleChatCompletions(
 
     // Convert to CLI input format and acquire a (possibly pre-warmed) subprocess
     const cliInput = openaiToCli(body);
-    const acquired = await processPool.acquire({
-      model: cliInput.model,
-      sessionId: cliInput.sessionId,
-      effort: cliInput.effort,
-      tools: cliInput.tools,
-    });
+    let acquired: AcquireResult | null = null;
+    try {
+      acquired = await processPool.acquire({
+        model: cliInput.model,
+        sessionId: cliInput.sessionId,
+        effort: cliInput.effort,
+        tools: cliInput.tools,
+      });
 
-    const mode = stream ? "stream" : "non-stream";
-    const promptKB = (Buffer.byteLength(cliInput.prompt, "utf8") / 1024).toFixed(1);
-    const extras = [
-      cliInput.effort && `effort=${cliInput.effort}`,
-      cliInput.tools !== undefined && `tools=${cliInput.tools || "none"}`,
-    ].filter(Boolean).join(" ");
-    console.log(
-      `[Req ${requestId.slice(0, 8)}] ${mode} model=${cliInput.model} prompt=${promptKB}KB pool=${acquired.source} acquire=${acquired.acquireMs}ms${extras ? " " + extras : ""}`
-    );
+      const mode = stream ? "stream" : "non-stream";
+      const promptKB = (Buffer.byteLength(cliInput.prompt, "utf8") / 1024).toFixed(1);
+      const extras = [
+        cliInput.effort && `effort=${cliInput.effort}`,
+        cliInput.tools !== undefined && `tools=${cliInput.tools || "none"}`,
+      ].filter(Boolean).join(" ");
+      console.log(
+        `[Req ${requestId.slice(0, 8)}] ${mode} model=${cliInput.model} prompt=${promptKB}KB pool=${acquired.source} acquire=${acquired.acquireMs}ms${extras ? " " + extras : ""}`
+      );
 
-    if (stream) {
-      await handleStreamingResponse(req, res, acquired.subprocess, cliInput, requestId, t0, acquired);
-    } else {
-      await handleNonStreamingResponse(res, acquired.subprocess, cliInput, requestId, t0, acquired);
+      if (stream) {
+        await handleStreamingResponse(req, res, acquired.subprocess, cliInput, requestId, t0, acquired);
+      } else {
+        await handleNonStreamingResponse(res, acquired.subprocess, cliInput, requestId, t0, acquired);
+      }
+    } catch (innerError) {
+      // Kill acquired subprocess if handler setup failed
+      acquired?.subprocess.kill();
+      throw innerError;
     }
   } catch (error) {
     const message = error instanceof Error ? error.message : "Unknown error";
@@ -292,11 +299,16 @@ async function handleStreamingResponse(
         res.write("data: [DONE]\n\n");
         res.end();
       }
+      // Ensure subprocess + descendants are reaped after normal completion.
+      // The CLI should exit on its own, but kill() guarantees cleanup of any
+      // lingering children (claude-agent-acp, etc.).
+      subprocess.kill();
       resolve();
     });
 
     subprocess.on("error", (error: Error) => {
       console.error("[Streaming] Error:", error.message);
+      subprocess.kill(); // Ensure subprocess + descendants are cleaned up
       if (!res.writableEnded) {
         res.write(
           `data: ${JSON.stringify({
@@ -312,10 +324,14 @@ async function handleStreamingResponse(
       // Subprocess exited - ensure response is closed
       if (!res.writableEnded) {
         if (code !== 0 && !isComplete) {
-          // Abnormal exit without result - send error
-          res.write(`data: ${JSON.stringify({
-            error: { message: `Process exited with code ${code}`, type: "server_error", code: null },
-          })}\n\n`);
+          // code 143 = SIGTERM (128+15), expected when we kill the process ourselves
+          const isSigterm = code === 143;
+          if (!isSigterm) {
+            // Abnormal exit without result - send error
+            res.write(`data: ${JSON.stringify({
+              error: { message: `Process exited with code ${code}`, type: "server_error", code: null },
+            })}\n\n`);
+          }
         }
         res.write("data: [DONE]\n\n");
         res.end();
@@ -327,6 +343,7 @@ async function handleStreamingResponse(
     try {
       subprocess.sendPrompt(cliInput.prompt);
     } catch (err) {
+      subprocess.kill();
       console.error("[Streaming] sendPrompt error:", err);
       reject(err);
     }
@@ -371,6 +388,7 @@ async function handleNonStreamingResponse(
 
     subprocess.on("error", (error: Error) => {
       console.error("[NonStreaming] Error:", error.message);
+      subprocess.kill(); // Ensure subprocess + descendants are cleaned up
       res.status(500).json({
         error: {
           message: error.message,
@@ -400,6 +418,8 @@ async function handleNonStreamingResponse(
           },
         });
       }
+      // Belt-and-suspenders: kill process group to reap lingering descendants
+      subprocess.kill();
       resolve();
     });
 
@@ -407,6 +427,7 @@ async function handleNonStreamingResponse(
     try {
       subprocess.sendPrompt(cliInput.prompt);
     } catch (error) {
+      subprocess.kill();
       const message = error instanceof Error ? error.message : String(error);
       console.log(`[Req ${rid}] FAIL sendPrompt: ${message} pool=${acquired.source}`);
       res.status(500).json({

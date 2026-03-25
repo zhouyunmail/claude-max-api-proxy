@@ -47,7 +47,7 @@ export interface SubprocessEvents {
   raw: (line: string) => void;
 }
 
-const DEFAULT_TIMEOUT = 900000; // 15 minutes
+const DEFAULT_TIMEOUT = 3600000; // 60 minutes
 
 /**
  * Compressed system prompt mapping OpenClaw tool names to Claude Code equivalents.
@@ -92,7 +92,10 @@ export class ClaudeSubprocess extends EventEmitter {
   private process: ChildProcess | null = null;
   private buffer: string = "";
   private timeoutId: NodeJS.Timeout | null = null;
+  private forceKillTimeoutId: NodeJS.Timeout | null = null;
   private isKilled: boolean = false;
+  /** Saved PID so we can kill the process group even after this.process is cleared */
+  private savedPid: number | undefined;
 
   /**
    * Spawn the Claude CLI subprocess without sending a prompt.
@@ -111,6 +114,7 @@ export class ClaudeSubprocess extends EventEmitter {
             Object.entries(process.env).filter(([k]) => k !== "CLAUDECODE")
           ),
           stdio: ["pipe", "pipe", "pipe"],
+          detached: process.platform !== "win32",
         });
 
         // Handle spawn errors (e.g., claude not found)
@@ -126,6 +130,8 @@ export class ClaudeSubprocess extends EventEmitter {
             reject(err);
           }
         });
+
+        this.savedPid = this.process.pid;
 
         if (process.env.DEBUG_SUBPROCESS) {
           console.error(`[Subprocess] Process spawned with PID: ${this.process.pid}`);
@@ -151,13 +157,19 @@ export class ClaudeSubprocess extends EventEmitter {
 
         // Handle process close
         this.process.on("close", (code) => {
-          if (code !== 0) {
-            console.error(`[Subprocess] Process closed with code: ${code}`);
+          // code 143 = SIGTERM (128+15), expected during pool shutdown / systemd restart
+          if (code !== 0 && code !== 143 && !this.isKilled) {
+            console.error(`[Subprocess] Process closed unexpectedly with code: ${code}`);
           }
           this.clearTimeout();
+          this.clearForceKillTimeout();
           if (this.buffer.trim()) {
             this.processBuffer();
           }
+          // Kill the entire process group to reap any lingering descendants
+          // (e.g. claude-agent-acp) that may outlive the main claude process.
+          this.killProcessGroup();
+          this.process = null;
           this.emit("close", code);
         });
 
@@ -181,9 +193,8 @@ export class ClaudeSubprocess extends EventEmitter {
     const t = timeout || DEFAULT_TIMEOUT;
     this.timeoutId = setTimeout(() => {
       if (!this.isKilled) {
-        this.isKilled = true;
-        this.process?.kill("SIGTERM");
         this.emit("error", new Error(`Request timed out after ${t}ms`));
+        this.kill(); // Process-group kill with SIGKILL escalation
       }
     }, t);
 
@@ -292,14 +303,72 @@ export class ClaudeSubprocess extends EventEmitter {
     }
   }
 
+  private clearForceKillTimeout(): void {
+    if (this.forceKillTimeoutId) {
+      clearTimeout(this.forceKillTimeoutId);
+      this.forceKillTimeoutId = null;
+    }
+  }
+
   /**
-   * Kill the subprocess
+   * Best-effort kill of the process group using the saved PID.
+   * Safe to call even after this.process has been cleared.
+   */
+  private killProcessGroup(): void {
+    const pid = this.savedPid;
+    if (!pid || process.platform === "win32") return;
+    try {
+      process.kill(-pid, "SIGTERM");
+    } catch {
+      // ESRCH: process group already gone — expected
+    }
+  }
+
+  /**
+   * Kill the subprocess (prefer process-group kill on POSIX so any descendants
+   * started by Claude CLI are also reaped).
    */
   kill(signal: NodeJS.Signals = "SIGTERM"): void {
-    if (!this.isKilled && this.process) {
-      this.isKilled = true;
-      this.clearTimeout();
+    if (this.isKilled || !this.process) return;
+
+    this.isKilled = true;
+    this.clearTimeout();
+    this.clearForceKillTimeout();
+
+    const pid = this.process.pid;
+    if (!pid) {
       this.process.kill(signal);
+      return;
+    }
+
+    try {
+      if (process.platform !== "win32") {
+        process.kill(-pid, signal);
+      } else {
+        this.process.kill(signal);
+      }
+    } catch {
+      try {
+        this.process.kill(signal);
+      } catch {
+        // Best effort only.
+      }
+    }
+
+    if (signal !== "SIGKILL") {
+      this.forceKillTimeoutId = setTimeout(() => {
+        if (this.process && this.process.exitCode === null) {
+          try {
+            if (process.platform !== "win32" && pid) {
+              process.kill(-pid, "SIGKILL");
+            } else {
+              this.process.kill("SIGKILL");
+            }
+          } catch {
+            // Best effort only.
+          }
+        }
+      }, 5_000);
     }
   }
 

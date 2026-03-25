@@ -29,6 +29,9 @@ const MAX_IDLE_MS = 300_000; // 5 minutes
 /** Default number of warm processes per model (override with POOL_SIZE env var) */
 const DEFAULT_POOL_SIZE = parseInt(process.env.POOL_SIZE || "3", 10) || 3;
 
+/** Only auto-refill the default model to avoid unbounded memory growth */
+const DEFAULT_WARM_MODEL: ClaudeModel = (process.env.WARM_MODEL as ClaudeModel) || "opus";
+
 /** Delay before refilling after an acquire */
 const REFILL_DELAY_MS = 100;
 
@@ -109,7 +112,10 @@ export class ProcessPool {
           `[Pool] HIT ${options.model} | acquire=${acquireMs}ms idle=${idleMs}ms remaining=${pool.length} discarded=${discarded}`
         );
         this.hits++;
-        this.scheduleRefill(options.model);
+        // Only refill the default warm model to prevent unbounded pool growth
+        if (options.model === DEFAULT_WARM_MODEL) {
+          this.scheduleRefill(options.model);
+        }
         return { subprocess: entry.subprocess, source: "hit", acquireMs };
       }
       // Dead or broken process — discard
@@ -128,7 +134,10 @@ export class ProcessPool {
     const acquireMs = Date.now() - t0;
     this.misses++;
     console.log(`[Pool] Cold spawn took ${acquireMs}ms`);
-    this.scheduleRefill(options.model);
+    // Only refill the default warm model to prevent unbounded pool growth
+    if (options.model === DEFAULT_WARM_MODEL) {
+      this.scheduleRefill(options.model);
+    }
     return { subprocess: sub, source: "miss", acquireMs };
   }
 
@@ -188,6 +197,7 @@ export class ProcessPool {
         return { subprocess: sub, createdAt: Date.now() };
       }
       console.warn(`[Pool] Process spawned but not ready for ${model} after ${elapsed}ms`);
+      sub.kill();
     } catch (err) {
       console.error(`[Pool] Spawn failed for ${model}:`, err);
       sub.kill();
@@ -225,8 +235,8 @@ export class ProcessPool {
         }
       }
       this.pools.set(model, kept);
-      // Refill if below target
-      if (kept.length < this.poolSize) {
+      // Only refill the default warm model
+      if (model === DEFAULT_WARM_MODEL && kept.length < this.poolSize) {
         this.scheduleRefill(model as ClaudeModel);
       }
     }
