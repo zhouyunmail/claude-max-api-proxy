@@ -53,9 +53,7 @@ async function main(): Promise<void> {
     console.log(`    -d '{"model": "claude-sonnet-4", "messages": [{"role": "user", "content": "Hello!"}]}'`);
     console.log("\nPress Ctrl+C to stop.\n");
 
-    // Pre-warm the process pool (non-blocking, logs internally)
-    console.log("Pre-warming process pool...");
-    await processPool.warmUp("opus");
+    console.log("Process pool: on-demand mode (no pre-warming)");
   } catch (err) {
     console.error("Failed to start server:", err);
     process.exit(1);
