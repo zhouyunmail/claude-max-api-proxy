@@ -7,6 +7,8 @@
 import express, { Express, Request, Response, NextFunction } from "express";
 import { createServer, Server } from "http";
 import { handleChatCompletions, handleModels, handleHealth } from "./routes.js";
+import { processPool } from "../subprocess/pool.js";
+import { sessionCleanupInterval } from "../session/manager.js";
 
 export interface ServerConfig {
   port: number;
@@ -159,6 +161,10 @@ export async function stopServer(): Promise<void> {
   if (!serverInstance) {
     return;
   }
+
+  // Clean up shared resources
+  clearInterval(sessionCleanupInterval);
+  processPool.shutdown();
 
   return new Promise((resolve, reject) => {
     serverInstance!.close((err) => {

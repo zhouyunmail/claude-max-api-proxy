@@ -159,7 +159,7 @@ sessionManager.load().catch((err) =>
   console.error("[SessionManager] Load error:", err)
 );
 
-// Periodic cleanup every hour
-setInterval(() => {
+// Periodic cleanup every hour (exported so server shutdown can clear it)
+export const sessionCleanupInterval = setInterval(() => {
   sessionManager.cleanup();
 }, 60 * 60 * 1000);

@@ -47,8 +47,8 @@ export function extractModel(model: string): ClaudeModel {
     return MODEL_MAP[stripped];
   }
 
-  // Default to opus (Claude Max subscription)
-  return "opus";
+  // Default to sonnet — safest fallback for unknown model strings
+  return "sonnet";
 }
 
 /**

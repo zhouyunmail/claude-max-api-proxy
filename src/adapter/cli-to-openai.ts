@@ -2,46 +2,8 @@
  * Converts Claude CLI output to OpenAI-compatible response format
  */
 
-import type { ClaudeCliAssistant, ClaudeCliResult } from "../types/claude-cli.js";
+import type { ClaudeCliResult } from "../types/claude-cli.js";
 import type { OpenAIChatResponse, OpenAIChatChunk, OpenAIToolCall } from "../types/openai.js";
-
-/**
- * Extract text content from Claude CLI assistant message
- */
-export function extractTextContent(message: ClaudeCliAssistant): string {
-  return message.message.content
-    .filter((c) => c.type === "text")
-    .map((c) => c.text)
-    .join("\n\n");
-}
-
-/**
- * Convert Claude CLI assistant message to OpenAI streaming chunk
- */
-export function cliToOpenaiChunk(
-  message: ClaudeCliAssistant,
-  requestId: string,
-  isFirst: boolean = false
-): OpenAIChatChunk {
-  const text = extractTextContent(message);
-
-  return {
-    id: `chatcmpl-${requestId}`,
-    object: "chat.completion.chunk",
-    created: Math.floor(Date.now() / 1000),
-    model: normalizeModelName(message.message.model),
-    choices: [
-      {
-        index: 0,
-        delta: {
-          role: isFirst ? "assistant" : undefined,
-          content: text,
-        },
-        finish_reason: message.message.stop_reason ? "stop" : null,
-      },
-    ],
-  };
-}
 
 /**
  * Create a final "done" chunk for streaming
@@ -106,13 +68,12 @@ export function cliResultToOpenai(
 }
 
 /**
- * Normalize Claude model names to a consistent format
- * e.g., "claude-sonnet-4-5-20250929" -> "claude-sonnet-4"
+ * Normalize Claude model names — strip date suffixes but preserve version.
+ * e.g., "claude-sonnet-4-5-20250929" -> "claude-sonnet-4-5"
+ *        "claude-opus-4-6-20260301"  -> "claude-opus-4-6"
  */
 function normalizeModelName(model: string | undefined): string {
   if (!model) return "claude-sonnet-4";
-  if (model.includes("opus")) return "claude-opus-4";
-  if (model.includes("sonnet")) return "claude-sonnet-4";
-  if (model.includes("haiku")) return "claude-haiku-4";
-  return model;
+  // Strip trailing date suffix (e.g. -20250929) but keep version numbers
+  return model.replace(/-\d{8}$/, "");
 }

@@ -14,7 +14,7 @@ import {
   cliResultToOpenai,
   createDoneChunk,
 } from "../adapter/cli-to-openai.js";
-import type { OpenAIChatRequest, OpenAIToolCall } from "../types/openai.js";
+import type { OpenAIChatRequest } from "../types/openai.js";
 import type { ClaudeCliAssistant, ClaudeCliResult, ClaudeCliStreamEvent } from "../types/claude-cli.js";
 
 /**
@@ -93,14 +93,6 @@ export async function handleChatCompletions(
 }
 
 /**
- * Convert Claude tool_use ID to OpenAI-compatible call ID.
- * Claude uses "toolu_abc123", OpenAI uses "call_abc123".
- */
-function toOpenAICallId(claudeId: string): string {
-  return `call_${claudeId.replace("toolu_", "")}`;
-}
-
-/**
  * Handle streaming response (SSE)
  *
  * IMPORTANT: The Express req.on("close") event fires when the request body
@@ -134,8 +126,6 @@ async function handleStreamingResponse(
     let lastModel = "claude-sonnet-4";
     let isComplete = false;
     let hasEmittedText = false;
-    let toolCallIndex = 0;
-    let inToolBlock = false;
     let ttfbLogged = false;
     const rid = requestId.slice(0, 8);
 
@@ -201,76 +191,37 @@ async function handleStreamingResponse(
       }
     });
 
-    // DISABLED: Tool call forwarding causes an agentic loop — OpenClaw interprets
-    // Claude Code's internal tool_use (Read, Bash, etc.) as calls it needs to
-    // handle, triggering repeated requests. Claude Code handles tools internally
-    // via --print mode; only the final text result should be forwarded.
-    // TODO: Re-enable with a non-tool_calls display mechanism (e.g. inline text).
-    //
-    // subprocess.on("tool_use_start", (event: ClaudeCliStreamEvent) => {
-    //   if (res.writableEnded) return;
-    //   const block = event.event.content_block;
-    //   if (block?.type !== "tool_use") return;
-    //
-    //   inToolBlock = true;
-    //   const chunk = {
-    //     id: `chatcmpl-${requestId}`,
-    //     object: "chat.completion.chunk",
-    //     created: Math.floor(Date.now() / 1000),
-    //     model: lastModel,
-    //     choices: [{
-    //       index: 0,
-    //       delta: {
-    //         role: isFirst ? "assistant" : undefined,
-    //         tool_calls: [{
-    //           index: toolCallIndex,
-    //           id: toOpenAICallId(block.id),
-    //           type: "function" as const,
-    //           function: {
-    //             name: block.name,
-    //             arguments: "",
-    //           },
-    //         }],
-    //       },
-    //       finish_reason: null,
-    //     }],
-    //   };
-    //   res.write(`data: ${JSON.stringify(chunk)}\n\n`);
-    //   isFirst = false;
-    // });
-    //
-    // subprocess.on("input_json_delta", (event: ClaudeCliStreamEvent) => {
-    //   if (res.writableEnded) return;
-    //   const delta = event.event.delta;
-    //   if (delta?.type !== "input_json_delta") return;
-    //
-    //   const chunk = {
-    //     id: `chatcmpl-${requestId}`,
-    //     object: "chat.completion.chunk",
-    //     created: Math.floor(Date.now() / 1000),
-    //     model: lastModel,
-    //     choices: [{
-    //       index: 0,
-    //       delta: {
-    //         tool_calls: [{
-    //           index: toolCallIndex,
-    //           function: {
-    //             arguments: delta.partial_json,
-    //           },
-    //         }],
-    //       },
-    //       finish_reason: null,
-    //     }],
-    //   };
-    //   res.write(`data: ${JSON.stringify(chunk)}\n\n`);
-    // });
-    //
-    // subprocess.on("content_block_stop", () => {
-    //   if (inToolBlock) {
-    //     toolCallIndex++;
-    //     inToolBlock = false;
-    //   }
-    // });
+    // Tool use events are forwarded as inline text (not tool_calls protocol)
+    // to avoid agentic loops where OpenClaw tries to handle Claude Code's
+    // internal tools (Read, Bash, etc.) as external tool calls.
+    subprocess.on("tool_use_start", (event: ClaudeCliStreamEvent) => {
+      if (res.writableEnded) return;
+      const block = event.event.content_block;
+      if (block?.type !== "tool_use") return;
+
+      // Format tool invocation as readable inline text
+      // Note: input arrives later via input_json_delta events, so we only
+      // show the tool name at start time
+      const toolText = `\n\n> **${block.name}**\n\n`;
+
+      const chunk = {
+        id: `chatcmpl-${requestId}`,
+        object: "chat.completion.chunk",
+        created: Math.floor(Date.now() / 1000),
+        model: lastModel,
+        choices: [{
+          index: 0,
+          delta: {
+            role: isFirst ? "assistant" : undefined,
+            content: toolText,
+          },
+          finish_reason: null,
+        }],
+      };
+      res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+      isFirst = false;
+      hasEmittedText = true;
+    });
 
     // Handle final assistant message (for model name)
     subprocess.on("assistant", (message: ClaudeCliAssistant) => {
@@ -364,23 +315,16 @@ async function handleNonStreamingResponse(
   const rid = requestId.slice(0, 8);
   return new Promise((resolve) => {
     let finalResult: ClaudeCliResult | null = null;
-    // DISABLED: see tool call forwarding comment in handleStreamingResponse
-    // const accumulatedToolCalls: OpenAIToolCall[] = [];
-    //
-    // subprocess.on("assistant", (message: ClaudeCliAssistant) => {
-    //   for (const block of message.message.content) {
-    //     if (block.type === "tool_use") {
-    //       accumulatedToolCalls.push({
-    //         id: toOpenAICallId(block.id),
-    //         type: "function",
-    //         function: {
-    //           name: block.name,
-    //           arguments: JSON.stringify(block.input),
-    //         },
-    //       });
-    //     }
-    //   }
-    // });
+    let clientDisconnected = false;
+
+    // Detect client disconnect — kill subprocess to avoid wasting resources
+    res.on("close", () => {
+      if (!finalResult) {
+        clientDisconnected = true;
+        console.log(`[Req ${rid}] Client disconnected before response, killing subprocess`);
+        subprocess.kill();
+      }
+    });
 
     subprocess.on("result", (result: ClaudeCliResult) => {
       finalResult = result;
@@ -389,19 +333,23 @@ async function handleNonStreamingResponse(
     subprocess.on("error", (error: Error) => {
       console.error("[NonStreaming] Error:", error.message);
       subprocess.kill(); // Ensure subprocess + descendants are cleaned up
-      res.status(500).json({
-        error: {
-          message: error.message,
-          type: "server_error",
-          code: null,
-        },
-      });
+      if (!clientDisconnected && !res.headersSent) {
+        res.status(500).json({
+          error: {
+            message: error.message,
+            type: "server_error",
+            code: null,
+          },
+        });
+      }
       resolve();
     });
 
     subprocess.on("close", (code: number | null) => {
       const totalMs = Date.now() - t0;
-      if (finalResult) {
+      if (clientDisconnected) {
+        console.log(`[Req ${rid}] ABORT non-stream total=${totalMs}ms (client disconnected) pool=${acquired.source}`);
+      } else if (finalResult) {
         const inputTokens = finalResult.usage?.input_tokens || 0;
         const outputTokens = finalResult.usage?.output_tokens || 0;
         console.log(
@@ -430,13 +378,15 @@ async function handleNonStreamingResponse(
       subprocess.kill();
       const message = error instanceof Error ? error.message : String(error);
       console.log(`[Req ${rid}] FAIL sendPrompt: ${message} pool=${acquired.source}`);
-      res.status(500).json({
-        error: {
-          message,
-          type: "server_error",
-          code: null,
-        },
-      });
+      if (!clientDisconnected && !res.headersSent) {
+        res.status(500).json({
+          error: {
+            message,
+            type: "server_error",
+            code: null,
+          },
+        });
+      }
       resolve();
     }
   });
