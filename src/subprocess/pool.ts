@@ -20,15 +20,28 @@ export interface AcquireResult {
   acquireMs: number;
 }
 
+interface ActiveProcess {
+  subprocess: ClaudeSubprocess;
+  model: string;
+  spawnedAt: number;
+  timer: ReturnType<typeof setTimeout>;
+}
+
 export class ProcessPool {
   private requests = 0;
   private activeCount = 0;
   private readonly maxConcurrent: number;
+  private readonly maxQueue: number;
+  private readonly sessionTimeoutMs: number;
   private waitQueue: Array<() => void> = [];
   private rejected = 0;
+  private timedOut = 0;
+  private activeProcesses = new Map<ClaudeSubprocess, ActiveProcess>();
 
-  constructor(maxConcurrent = 3) {
+  constructor(maxConcurrent = 5, maxQueue = 10, sessionTimeoutMs = 30 * 60 * 1000) {
     this.maxConcurrent = maxConcurrent;
+    this.maxQueue = maxQueue;
+    this.sessionTimeoutMs = sessionTimeoutMs;
   }
 
   /**
@@ -50,7 +63,7 @@ export class ProcessPool {
       return;
     }
 
-    if (this.waitQueue.length >= this.maxConcurrent * 2) {
+    if (this.waitQueue.length >= this.maxQueue) {
       this.rejected++;
       throw new Error(
         `Server overloaded: ${this.activeCount} active, ${this.waitQueue.length} queued (max ${this.maxConcurrent})`
@@ -102,8 +115,31 @@ export class ProcessPool {
       throw err;
     }
 
-    // Auto-release slot when subprocess exits
-    sub.once("close", () => this.release());
+    // Session timeout — kill subprocess if it runs longer than sessionTimeoutMs
+    const timer = setTimeout(() => {
+      this.timedOut++;
+      const elapsed = ((Date.now() - t0) / 1000 / 60).toFixed(1);
+      console.log(
+        `[Pool] TIMEOUT after ${elapsed}min — killing ${options.model} subprocess (limit=${this.sessionTimeoutMs / 60000}min)`
+      );
+      sub.kill();
+    }, this.sessionTimeoutMs);
+
+    // Track active process
+    const entry: ActiveProcess = {
+      subprocess: sub,
+      model: options.model,
+      spawnedAt: t0,
+      timer,
+    };
+    this.activeProcesses.set(sub, entry);
+
+    // Auto-release slot and cleanup when subprocess exits
+    sub.once("close", () => {
+      clearTimeout(timer);
+      this.activeProcesses.delete(sub);
+      this.release();
+    });
 
     const acquireMs = Date.now() - t0;
     this.requests++;
@@ -117,6 +153,13 @@ export class ProcessPool {
    * Kill any queued waiters and log shutdown.
    */
   shutdown(): void {
+    // Clear all session timers and kill active subprocesses
+    for (const entry of this.activeProcesses.values()) {
+      clearTimeout(entry.timer);
+      entry.subprocess.kill();
+    }
+    this.activeProcesses.clear();
+
     for (const resolve of this.waitQueue) {
       resolve(); // unblock — acquire will fail because pool is shutting down
     }
@@ -127,23 +170,26 @@ export class ProcessPool {
   /**
    * Get pool statistics for the health endpoint.
    */
-  stats(): {
-    size: number;
-    ready: Record<string, number>;
-    requests: number;
-    active: number;
-    maxConcurrent: number;
-    queued: number;
-    rejected: number;
-  } {
+  stats() {
+    const now = Date.now();
+    const activeDetails = Array.from(this.activeProcesses.values()).map((entry) => ({
+      model: entry.model,
+      runningMs: now - entry.spawnedAt,
+      runningMin: +((now - entry.spawnedAt) / 60000).toFixed(1),
+    }));
+
     return {
       size: 0,
       ready: {},
       requests: this.requests,
       active: this.activeCount,
       maxConcurrent: this.maxConcurrent,
+      maxQueue: this.maxQueue,
+      sessionTimeoutMin: this.sessionTimeoutMs / 60000,
       queued: this.waitQueue.length,
       rejected: this.rejected,
+      timedOut: this.timedOut,
+      activeDetails,
     };
   }
 }
