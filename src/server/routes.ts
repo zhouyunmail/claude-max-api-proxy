@@ -130,12 +130,13 @@ async function handleStreamingResponse(
     const rid = requestId.slice(0, 8);
 
     // Handle actual client disconnect (response stream closed)
+    // Do NOT kill the subprocess — let it run to completion so the AI
+    // response is always consumed (avoids wasting in-flight compute).
     res.on("close", () => {
       if (!isComplete) {
-        // Client disconnected before response completed - kill subprocess
-        subprocess.kill();
+        console.log(`[Req ${requestId.slice(0, 8)}] Client disconnected (stream), subprocess continues`);
       }
-      resolve();
+      // Do not resolve here — wait for subprocess result/close to resolve
     });
 
     // When a new text content block starts after we've already emitted text,
@@ -303,6 +304,10 @@ async function handleStreamingResponse(
 
 /**
  * Handle non-streaming response
+ *
+ * Uses internal streaming to keep the HTTP connection alive (periodic
+ * whitespace flushes) while Opus thinks. This prevents upstream gateways
+ * from hitting their idle-timeout and aborting the request.
  */
 async function handleNonStreamingResponse(
   res: Response,
@@ -313,17 +318,32 @@ async function handleNonStreamingResponse(
   acquired: AcquireResult,
 ): Promise<void> {
   const rid = requestId.slice(0, 8);
+
+  // Keep-alive: send a single space every 10s so the gateway doesn't
+  // consider the connection idle. The final JSON is written with
+  // res.end() which flushes everything.
+  const keepAlive = setInterval(() => {
+    if (!res.writableEnded) {
+      res.write(" ");
+    }
+  }, 10_000);
+
   return new Promise((resolve) => {
     let finalResult: ClaudeCliResult | null = null;
     let clientDisconnected = false;
 
-    // Detect client disconnect — kill subprocess to avoid wasting resources
+    const cleanup = () => {
+      clearInterval(keepAlive);
+    };
+
+    // Detect client disconnect — do NOT kill subprocess, let it run to completion
+    // so the AI's response is always fully consumed (avoids wasted in-flight compute).
     res.on("close", () => {
       if (!finalResult) {
         clientDisconnected = true;
-        console.log(`[Req ${rid}] Client disconnected before response, killing subprocess`);
-        subprocess.kill();
+        console.log(`[Req ${rid}] Client disconnected (non-stream), subprocess continues`);
       }
+      // Do not cleanup here — keepAlive and subprocess will be cleaned up on close/result
     });
 
     subprocess.on("result", (result: ClaudeCliResult) => {
@@ -333,6 +353,7 @@ async function handleNonStreamingResponse(
     subprocess.on("error", (error: Error) => {
       console.error("[NonStreaming] Error:", error.message);
       subprocess.kill(); // Ensure subprocess + descendants are cleaned up
+      cleanup();
       if (!clientDisconnected && !res.headersSent) {
         res.status(500).json({
           error: {
@@ -346,6 +367,7 @@ async function handleNonStreamingResponse(
     });
 
     subprocess.on("close", (code: number | null) => {
+      cleanup();
       const totalMs = Date.now() - t0;
       if (clientDisconnected) {
         console.log(`[Req ${rid}] ABORT non-stream total=${totalMs}ms (client disconnected) pool=${acquired.source}`);
@@ -355,7 +377,13 @@ async function handleNonStreamingResponse(
         console.log(
           `[Req ${rid}] DONE non-stream total=${totalMs}ms tokens=${inputTokens}+${outputTokens} pool=${acquired.source}`
         );
-        res.json(cliResultToOpenai(finalResult, requestId));
+        // Use res.end() with the JSON payload so any buffered keep-alive
+        // spaces + the actual body are flushed together.
+        const payload = JSON.stringify(cliResultToOpenai(finalResult, requestId));
+        if (!res.headersSent) {
+          res.setHeader("Content-Type", "application/json");
+        }
+        res.end(payload);
       } else if (!res.headersSent) {
         console.log(`[Req ${rid}] FAIL non-stream total=${totalMs}ms exit=${code} pool=${acquired.source}`);
         res.status(500).json({
@@ -376,6 +404,7 @@ async function handleNonStreamingResponse(
       subprocess.sendPrompt(cliInput.prompt);
     } catch (error) {
       subprocess.kill();
+      cleanup();
       const message = error instanceof Error ? error.message : String(error);
       console.log(`[Req ${rid}] FAIL sendPrompt: ${message} pool=${acquired.source}`);
       if (!clientDisconnected && !res.headersSent) {
