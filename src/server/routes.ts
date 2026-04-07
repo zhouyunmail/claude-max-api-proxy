@@ -352,11 +352,11 @@ async function handleNonStreamingResponse(
     // Detect client disconnect — do NOT kill subprocess, let it run to completion
     // so the AI's response is always fully consumed (avoids wasted in-flight compute).
     res.on("close", () => {
+      clearInterval(keepAlive);
       if (!finalResult) {
         clientDisconnected = true;
         console.log(`[Req ${rid}] Client disconnected (non-stream), subprocess continues`);
       }
-      // Do not cleanup here — keepAlive and subprocess will be cleaned up on close/result
     });
 
     subprocess.on("result", (result: ClaudeCliResult) => {
