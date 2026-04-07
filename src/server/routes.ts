@@ -403,6 +403,10 @@ async function handleNonStreamingResponse(
             code: null,
           },
         });
+      } else if (!res.writableEnded) {
+        // Headers already sent by keep-alive writes but no result arrived — just close
+        console.log(`[Req ${rid}] FAIL non-stream total=${totalMs}ms exit=${code} (headers already sent) pool=${acquired.source}`);
+        res.end();
       }
       // Belt-and-suspenders: kill process group to reap lingering descendants
       subprocess.kill();
