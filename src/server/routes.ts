@@ -363,26 +363,25 @@ async function handleNonStreamingResponse(
       finalResult = result;
     });
 
+    /** End the response with an error JSON body.
+     *  Works whether or not keep-alive has already flushed headers —
+     *  leading whitespace is valid JSON, so " {error}" still parses. */
+    const endWithError = (message: string) => {
+      if (res.writableEnded || clientDisconnected) return;
+      if (!res.headersSent) res.status(500);
+      res.end(JSON.stringify({
+        error: { message, type: "server_error", code: null },
+      }));
+    };
+
     subprocess.on("error", (error: Error) => {
       console.error("[NonStreaming] Error:", error.message);
       subprocess.kill(); // Ensure subprocess + descendants are cleaned up
       cleanup();
       // Guard: if result already arrived, let the close handler send the
       // success response instead of overwriting it with an error.
-      if (!finalResult && !clientDisconnected) {
-        if (!res.headersSent) {
-          res.status(500).json({
-            error: {
-              message: error.message,
-              type: "server_error",
-              code: null,
-            },
-          });
-        } else if (!res.writableEnded) {
-          // Headers already sent (keep-alive wrote spaces) — must still
-          // end the response so the client doesn't hang forever.
-          res.end();
-        }
+      if (!finalResult) {
+        endWithError(error.message);
       }
       resolve();
     });
@@ -392,7 +391,7 @@ async function handleNonStreamingResponse(
       const totalMs = Date.now() - t0;
       if (clientDisconnected) {
         console.log(`[Req ${rid}] ABORT non-stream total=${totalMs}ms (client disconnected) pool=${acquired.source}`);
-      } else if (finalResult) {
+      } else if (finalResult && !res.writableEnded) {
         const inputTokens = finalResult.usage?.input_tokens || 0;
         const outputTokens = finalResult.usage?.output_tokens || 0;
         console.log(
@@ -400,21 +399,10 @@ async function handleNonStreamingResponse(
         );
         // Use res.end() with the JSON payload so any buffered keep-alive
         // spaces + the actual body are flushed together.
-        const payload = JSON.stringify(cliResultToOpenai(finalResult, requestId));
-        res.end(payload);
-      } else if (!res.headersSent) {
+        res.end(JSON.stringify(cliResultToOpenai(finalResult, requestId)));
+      } else if (!finalResult) {
         console.log(`[Req ${rid}] FAIL non-stream total=${totalMs}ms exit=${code} pool=${acquired.source}`);
-        res.status(500).json({
-          error: {
-            message: `Claude CLI exited with code ${code} without response`,
-            type: "server_error",
-            code: null,
-          },
-        });
-      } else if (!res.writableEnded) {
-        // Headers already sent by keep-alive writes but no result arrived — just close
-        console.log(`[Req ${rid}] FAIL non-stream total=${totalMs}ms exit=${code} (headers already sent) pool=${acquired.source}`);
-        res.end();
+        endWithError(`Claude CLI exited with code ${code} without response`);
       }
       // Belt-and-suspenders: kill process group to reap lingering descendants
       subprocess.kill();
@@ -429,15 +417,7 @@ async function handleNonStreamingResponse(
       cleanup();
       const message = error instanceof Error ? error.message : String(error);
       console.log(`[Req ${rid}] FAIL sendPrompt: ${message} pool=${acquired.source}`);
-      if (!clientDisconnected && !res.headersSent) {
-        res.status(500).json({
-          error: {
-            message,
-            type: "server_error",
-            code: null,
-          },
-        });
-      }
+      endWithError(message);
       resolve();
     }
   });
