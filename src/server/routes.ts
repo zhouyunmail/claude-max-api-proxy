@@ -327,6 +327,11 @@ async function handleNonStreamingResponse(
 ): Promise<void> {
   const rid = requestId.slice(0, 8);
 
+  // Pre-set Content-Type before any keep-alive writes, which flush headers.
+  // Without this, if keep-alive fires first, headersSent becomes true and
+  // the close handler can no longer set Content-Type.
+  res.setHeader("Content-Type", "application/json");
+
   // Keep-alive: send a single space every 10s so the gateway doesn't
   // consider the connection idle. The final JSON is written with
   // res.end() which flushes everything.
@@ -396,9 +401,6 @@ async function handleNonStreamingResponse(
         // Use res.end() with the JSON payload so any buffered keep-alive
         // spaces + the actual body are flushed together.
         const payload = JSON.stringify(cliResultToOpenai(finalResult, requestId));
-        if (!res.headersSent) {
-          res.setHeader("Content-Type", "application/json");
-        }
         res.end(payload);
       } else if (!res.headersSent) {
         console.log(`[Req ${rid}] FAIL non-stream total=${totalMs}ms exit=${code} pool=${acquired.source}`);
