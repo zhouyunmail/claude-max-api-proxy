@@ -296,8 +296,16 @@ async function handleStreamingResponse(
       subprocess.sendPrompt(cliInput.prompt);
     } catch (err) {
       subprocess.kill();
-      console.error("[Streaming] sendPrompt error:", err);
-      reject(err);
+      const message = err instanceof Error ? err.message : String(err);
+      console.error("[Streaming] sendPrompt error:", message);
+      // Headers already flushed — cannot send a JSON 500. Write an SSE error
+      // event instead so the client gets a readable failure message.
+      if (!res.writableEnded) {
+        res.write(`data: ${JSON.stringify({ error: { message, type: "server_error", code: null } })}\n\n`);
+        res.write("data: [DONE]\n\n");
+        res.end();
+      }
+      resolve();
     }
   });
 }
@@ -354,7 +362,9 @@ async function handleNonStreamingResponse(
       console.error("[NonStreaming] Error:", error.message);
       subprocess.kill(); // Ensure subprocess + descendants are cleaned up
       cleanup();
-      if (!clientDisconnected && !res.headersSent) {
+      // Guard: if result already arrived, let the close handler send the
+      // success response instead of overwriting it with an error.
+      if (!finalResult && !clientDisconnected && !res.headersSent) {
         res.status(500).json({
           error: {
             message: error.message,
