@@ -199,8 +199,11 @@ export class ClaudeSubprocess extends EventEmitter {
     }, t);
 
     // Pass prompt via stdin to avoid E2BIG on large inputs
-    this.process.stdin?.write(prompt);
-    this.process.stdin?.end();
+    if (!this.process.stdin || !this.process.stdin.writable) {
+      throw new Error("Cannot send prompt: stdin is not writable");
+    }
+    this.process.stdin.write(prompt);
+    this.process.stdin.end();
   }
 
   /**

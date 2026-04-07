@@ -364,14 +364,20 @@ async function handleNonStreamingResponse(
       cleanup();
       // Guard: if result already arrived, let the close handler send the
       // success response instead of overwriting it with an error.
-      if (!finalResult && !clientDisconnected && !res.headersSent) {
-        res.status(500).json({
-          error: {
-            message: error.message,
-            type: "server_error",
-            code: null,
-          },
-        });
+      if (!finalResult && !clientDisconnected) {
+        if (!res.headersSent) {
+          res.status(500).json({
+            error: {
+              message: error.message,
+              type: "server_error",
+              code: null,
+            },
+          });
+        } else if (!res.writableEnded) {
+          // Headers already sent (keep-alive wrote spaces) — must still
+          // end the response so the client doesn't hang forever.
+          res.end();
+        }
       }
       resolve();
     });
