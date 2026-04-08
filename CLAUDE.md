@@ -11,43 +11,41 @@ npm run dev      # Watch mode for development
 
 ## Service Management
 
-The proxy runs as a macOS LaunchAgent on port 3456.
+The proxy runs as a Linux systemd --user service on port 3456.
 
-**Plist location:** `~/Library/LaunchAgents/com.openclaw.claude-max-proxy.plist`
+**Service file:** `~/.config/systemd/user/claude-max-api-proxy.service`
 
-**Logs:**
-- stdout: `~/.openclaw/logs/claude-max-proxy.log`
-- stderr: `~/.openclaw/logs/claude-max-proxy.err.log`
+**Logs:** `journalctl --user -u claude-max-api-proxy -f`
 
 ### Restart the service
 
 ```bash
-launchctl kickstart -k gui/$(id -u)/com.openclaw.claude-max-proxy
+systemctl --user restart claude-max-api-proxy
 ```
 
 ### Stop the service
 
 ```bash
-launchctl bootout gui/$(id -u)/com.openclaw.claude-max-proxy
+systemctl --user stop claude-max-api-proxy
 ```
 
-### Start the service (after stop or plist change)
+### Start the service
 
 ```bash
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.openclaw.claude-max-proxy.plist
+systemctl --user start claude-max-api-proxy
 ```
 
-### Reload after plist changes
+### Reload after service file changes
 
 ```bash
-launchctl bootout gui/$(id -u)/com.openclaw.claude-max-proxy
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.openclaw.claude-max-proxy.plist
+systemctl --user daemon-reload
+systemctl --user restart claude-max-api-proxy
 ```
 
 ### Check status
 
 ```bash
-launchctl list com.openclaw.claude-max-proxy
+systemctl --user status claude-max-api-proxy
 ```
 
 ## Architecture

@@ -110,6 +110,9 @@ export class ProcessPool {
             clearTimeout(entry.timer);
             this.activeProcesses.delete(sub);
             sub.kill(); // best-effort
+            // Force-emit "close" so any pending route Promise resolves and
+            // frees req/res/subprocess references (D-state won't emit it naturally).
+            sub.emit("close", null);
             this.release();
             continue;
           }
@@ -127,6 +130,8 @@ export class ProcessPool {
           clearTimeout(entry.timer);
           this.activeProcesses.delete(sub);
           sub.kill();
+          // Force-emit "close" so any pending route Promise resolves and frees resources.
+          sub.emit("close", null);
           this.release();
         }
       }
@@ -227,6 +232,8 @@ export class ProcessPool {
             `[Pool] Force-releasing stuck slot for ${options.model} (D-state / unkillable after ${FORCE_RELEASE_GRACE_MS / 1000}s)`
           );
           this.activeProcesses.delete(sub);
+          // Force-emit "close" so any pending route Promise resolves and frees resources.
+          sub.emit("close", null);
           this.release();
         }
       }, FORCE_RELEASE_GRACE_MS);

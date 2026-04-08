@@ -371,6 +371,9 @@ export class ClaudeSubprocess extends EventEmitter {
             // Best effort only.
           }
         }
+        // Release ChildProcess reference even if D-state (SIGKILL had no effect).
+        // The pool will have already force-emitted "close" to unblock routes.
+        this.process = null;
       }, 5_000);
     }
   }
