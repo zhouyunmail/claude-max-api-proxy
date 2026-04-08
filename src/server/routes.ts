@@ -128,13 +128,26 @@ async function handleStreamingResponse(
     let hasEmittedText = false;
     let ttfbLogged = false;
     const rid = requestId.slice(0, 8);
+    let gracePeriodId: NodeJS.Timeout | null = null;
+
+    const clearGracePeriod = () => {
+      if (gracePeriodId) {
+        clearTimeout(gracePeriodId);
+        gracePeriodId = null;
+      }
+    };
 
     // Handle actual client disconnect (response stream closed)
-    // Do NOT kill the subprocess — let it run to completion so the AI
-    // response is always consumed (avoids wasting in-flight compute).
+    // Give subprocess a 180s grace period to finish; kill if it overruns.
     res.on("close", () => {
       if (!isComplete) {
-        console.log(`[Req ${requestId.slice(0, 8)}] Client disconnected (stream), subprocess continues`);
+        console.log(`[Req ${rid}] Client disconnected (stream), grace period 180s`);
+        gracePeriodId = setTimeout(() => {
+          if (!isComplete) {
+            console.log(`[Req ${rid}] Grace period expired, killing subprocess`);
+            subprocess.kill();
+          }
+        }, 180_000);
       }
       // Do not resolve here — wait for subprocess result/close to resolve
     });
@@ -231,6 +244,7 @@ async function handleStreamingResponse(
 
     subprocess.on("result", (result: ClaudeCliResult) => {
       isComplete = true;
+      clearGracePeriod();
       const totalMs = Date.now() - t0;
       const inputTokens = result.usage?.input_tokens || 0;
       const outputTokens = result.usage?.output_tokens || 0;
@@ -260,6 +274,7 @@ async function handleStreamingResponse(
 
     subprocess.on("error", (error: Error) => {
       console.error("[Streaming] Error:", error.message);
+      clearGracePeriod();
       subprocess.kill(); // Ensure subprocess + descendants are cleaned up
       if (!res.writableEnded) {
         res.write(
@@ -273,6 +288,7 @@ async function handleStreamingResponse(
     });
 
     subprocess.on("close", (code: number | null) => {
+      clearGracePeriod();
       // Subprocess exited - ensure response is closed
       if (!res.writableEnded) {
         if (code !== 0 && !isComplete) {
@@ -344,18 +360,28 @@ async function handleNonStreamingResponse(
   return new Promise((resolve) => {
     let finalResult: ClaudeCliResult | null = null;
     let clientDisconnected = false;
+    let gracePeriodId: NodeJS.Timeout | null = null;
 
     const cleanup = () => {
       clearInterval(keepAlive);
+      if (gracePeriodId) {
+        clearTimeout(gracePeriodId);
+        gracePeriodId = null;
+      }
     };
 
-    // Detect client disconnect — do NOT kill subprocess, let it run to completion
-    // so the AI's response is always fully consumed (avoids wasted in-flight compute).
+    // Detect client disconnect — give subprocess 180s grace period, then kill.
     res.on("close", () => {
       cleanup();
       if (!finalResult) {
         clientDisconnected = true;
-        console.log(`[Req ${rid}] Client disconnected (non-stream), subprocess continues`);
+        console.log(`[Req ${rid}] Client disconnected (non-stream), grace period 180s`);
+        gracePeriodId = setTimeout(() => {
+          if (!finalResult) {
+            console.log(`[Req ${rid}] Grace period expired, killing subprocess`);
+            subprocess.kill();
+          }
+        }, 180_000);
       }
     });
 
