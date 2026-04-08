@@ -376,44 +376,10 @@ export class ClaudeSubprocess extends EventEmitter {
   }
 
   /**
-   * Wait for the CLI to emit its init message, indicating it's fully
-   * initialized and ready to accept a prompt via stdin.
-   * Used by the process pool to ensure pre-warmed processes are truly ready.
+   * Get the PID of the underlying process (undefined if not spawned or already exited).
    */
-  waitForInit(timeout = 30_000): Promise<void> {
-    return new Promise<void>((resolve, reject) => {
-      if (!this.process || this.isKilled) {
-        reject(new Error("Process not running"));
-        return;
-      }
-
-      const timer = setTimeout(() => {
-        this.removeListener("message", handler);
-        reject(new Error(`Timed out waiting for CLI init after ${timeout}ms`));
-      }, timeout);
-
-      const cleanup = () => {
-        clearTimeout(timer);
-        this.removeListener("message", handler);
-        this.removeListener("close", closeHandler);
-      };
-
-      const handler = (msg: ClaudeCliMessage) => {
-        if (msg.type === "system" && (msg as ClaudeCliSystemMessage).subtype === "init") {
-          cleanup();
-          resolve();
-        }
-      };
-
-      // Also reject if process exits (avoid dangling promise)
-      const closeHandler = () => {
-        cleanup();
-        reject(new Error("Process exited before init"));
-      };
-
-      this.on("message", handler);
-      this.once("close", closeHandler);
-    });
+  get pid(): number | undefined {
+    return this.savedPid;
   }
 
   /**

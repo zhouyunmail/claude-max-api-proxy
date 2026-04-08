@@ -3,7 +3,7 @@
  */
 
 import type { ClaudeCliResult } from "../types/claude-cli.js";
-import type { OpenAIChatResponse, OpenAIChatChunk, OpenAIToolCall } from "../types/openai.js";
+import type { OpenAIChatResponse, OpenAIChatChunk } from "../types/openai.js";
 
 /**
  * Create a final "done" chunk for streaming
@@ -30,7 +30,6 @@ export function createDoneChunk(requestId: string, model: string): OpenAIChatChu
 export function cliResultToOpenai(
   result: ClaudeCliResult,
   requestId: string,
-  toolCalls?: OpenAIToolCall[]
 ): OpenAIChatResponse {
   // Get model from modelUsage or default
   const modelName = result.modelUsage
@@ -41,10 +40,6 @@ export function cliResultToOpenai(
     role: "assistant",
     content: result.result,
   };
-
-  if (toolCalls && toolCalls.length > 0) {
-    message.tool_calls = toolCalls;
-  }
 
   return {
     id: `chatcmpl-${requestId}`,

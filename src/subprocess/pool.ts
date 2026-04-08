@@ -8,9 +8,27 @@
  * so the overhead is negligible; real latency is the Claude API response.
  */
 
+import fs from "fs";
 import { ClaudeSubprocess } from "./manager.js";
 import type { EffortLevel } from "./manager.js";
 import type { ClaudeModel } from "../adapter/openai-to-cli.js";
+
+/**
+ * Check if a process is in D-state (uninterruptible sleep) via /proc.
+ * Returns true only on Linux when the process state is "D".
+ * Returns false on non-Linux or if /proc is unreadable.
+ */
+function isProcessInDState(pid: number | undefined): boolean {
+  if (!pid || process.platform !== "linux") return false;
+  try {
+    const status = fs.readFileSync(`/proc/${pid}/status`, "utf8");
+    const match = status.match(/^State:\s+(\S)/m);
+    return match?.[1] === "D";
+  } catch {
+    // ENOENT = process already exited, EACCES = no permission — both fine
+    return false;
+  }
+}
 
 export interface AcquireResult {
   subprocess: ClaudeSubprocess;
@@ -22,9 +40,12 @@ export interface AcquireResult {
 
 interface ActiveProcess {
   subprocess: ClaudeSubprocess;
+  pid: number | undefined;
   model: string;
   spawnedAt: number;
   timer: ReturnType<typeof setTimeout>;
+  /** Timestamp when D-state was first observed (0 = not in D-state) */
+  dStateSince: number;
 }
 
 export class ProcessPool {
@@ -36,12 +57,81 @@ export class ProcessPool {
   private waitQueue: Array<() => void> = [];
   private rejected = 0;
   private timedOut = 0;
+  private forceReleased = 0;
   private activeProcesses = new Map<ClaudeSubprocess, ActiveProcess>();
+  private reaperInterval: ReturnType<typeof setInterval> | null = null;
+
+  /** Grace period after sessionTimeout before the reaper force-releases a slot */
+  private static readonly REAPER_GRACE_MS = 30_000;
+  /** How often the reaper scans for stuck processes */
+  private static readonly REAPER_INTERVAL_MS = 30_000;
+  /** How long a process must be in D-state before early force-release */
+  private static readonly D_STATE_THRESHOLD_MS = 60_000;
 
   constructor(maxConcurrent = 5, maxQueue = 10, sessionTimeoutMs = 30 * 60 * 1000) {
     this.maxConcurrent = maxConcurrent;
     this.maxQueue = maxQueue;
     this.sessionTimeoutMs = sessionTimeoutMs;
+    this.startReaper();
+  }
+
+  /**
+   * Periodic reaper that runs every 30s with two responsibilities:
+   *
+   * 1. **D-state early detection** (Linux only): reads /proc/<pid>/status
+   *    to find processes stuck in uninterruptible sleep. If a process stays
+   *    in D-state for > D_STATE_THRESHOLD_MS (60s), the slot is force-released
+   *    immediately — no need to wait for the full 30-min session timeout.
+   *
+   * 2. **Deadline safety net**: any process alive beyond sessionTimeout + grace
+   *    is force-released regardless of state (catches event leaks, etc).
+   */
+  private startReaper(): void {
+    this.reaperInterval = setInterval(() => {
+      const now = Date.now();
+      const deadline = this.sessionTimeoutMs + ProcessPool.REAPER_GRACE_MS;
+
+      for (const [sub, entry] of this.activeProcesses) {
+        const elapsed = now - entry.spawnedAt;
+
+        // --- Check 1: D-state early release ---
+        if (isProcessInDState(entry.pid)) {
+          if (entry.dStateSince === 0) {
+            entry.dStateSince = now;
+            console.log(
+              `[Pool] Reaper: D-state detected for ${entry.model} pid=${entry.pid} (alive ${(elapsed / 1000).toFixed(0)}s) — watching`
+            );
+          } else if (now - entry.dStateSince >= ProcessPool.D_STATE_THRESHOLD_MS) {
+            this.forceReleased++;
+            const dSec = ((now - entry.dStateSince) / 1000).toFixed(0);
+            console.log(
+              `[Pool] Reaper: force-releasing D-state ${entry.model} pid=${entry.pid} (D-state for ${dSec}s)`
+            );
+            clearTimeout(entry.timer);
+            this.activeProcesses.delete(sub);
+            sub.kill(); // best-effort
+            this.release();
+            continue;
+          }
+        } else {
+          // Clear D-state tracker if process recovered
+          entry.dStateSince = 0;
+        }
+
+        // --- Check 2: absolute deadline ---
+        if (elapsed > deadline) {
+          this.forceReleased++;
+          console.log(
+            `[Pool] Reaper: force-releasing stuck ${entry.model} slot (alive ${(elapsed / 60000).toFixed(1)}min, limit=${(deadline / 60000).toFixed(1)}min)`
+          );
+          clearTimeout(entry.timer);
+          this.activeProcesses.delete(sub);
+          sub.kill();
+          this.release();
+        }
+      }
+    }, ProcessPool.REAPER_INTERVAL_MS);
+    this.reaperInterval.unref();
   }
 
   /**
@@ -116,6 +206,10 @@ export class ProcessPool {
     }
 
     // Session timeout — kill subprocess if it runs longer than sessionTimeoutMs
+    // If the process is in D-state (uninterruptible sleep, e.g. NFS), kill()
+    // has no effect and the "close" event never fires. A secondary timer
+    // force-releases the slot so the pool doesn't leak permanently.
+    const FORCE_RELEASE_GRACE_MS = 10_000;
     const timer = setTimeout(() => {
       this.timedOut++;
       const elapsed = ((Date.now() - t0) / 1000 / 60).toFixed(1);
@@ -123,14 +217,30 @@ export class ProcessPool {
         `[Pool] TIMEOUT after ${elapsed}min — killing ${options.model} subprocess (limit=${this.sessionTimeoutMs / 60000}min)`
       );
       sub.kill();
+
+      // Fallback: if close event doesn't fire within grace period,
+      // force-release the slot to prevent permanent pool leak (D-state processes).
+      const fallback = setTimeout(() => {
+        if (this.activeProcesses.has(sub)) {
+          this.forceReleased++;
+          console.log(
+            `[Pool] Force-releasing stuck slot for ${options.model} (D-state / unkillable after ${FORCE_RELEASE_GRACE_MS / 1000}s)`
+          );
+          this.activeProcesses.delete(sub);
+          this.release();
+        }
+      }, FORCE_RELEASE_GRACE_MS);
+      fallback.unref();
     }, this.sessionTimeoutMs);
 
     // Track active process
     const entry: ActiveProcess = {
       subprocess: sub,
+      pid: sub.pid,
       model: options.model,
       spawnedAt: t0,
       timer,
+      dStateSince: 0,
     };
     this.activeProcesses.set(sub, entry);
 
@@ -153,6 +263,11 @@ export class ProcessPool {
    * Kill any queued waiters and log shutdown.
    */
   shutdown(): void {
+    if (this.reaperInterval) {
+      clearInterval(this.reaperInterval);
+      this.reaperInterval = null;
+    }
+
     // Clear all session timers and kill active subprocesses
     for (const entry of this.activeProcesses.values()) {
       clearTimeout(entry.timer);
@@ -174,8 +289,13 @@ export class ProcessPool {
     const now = Date.now();
     const activeDetails = Array.from(this.activeProcesses.values()).map((entry) => ({
       model: entry.model,
+      pid: entry.pid,
       runningMs: now - entry.spawnedAt,
       runningMin: +((now - entry.spawnedAt) / 60000).toFixed(1),
+      dState: entry.dStateSince > 0 ? {
+        since: new Date(entry.dStateSince).toISOString(),
+        durationMs: now - entry.dStateSince,
+      } : null,
     }));
 
     return {
@@ -189,6 +309,7 @@ export class ProcessPool {
       queued: this.waitQueue.length,
       rejected: this.rejected,
       timedOut: this.timedOut,
+      forceReleased: this.forceReleased,
       activeDetails,
     };
   }
